@@ -95,9 +95,7 @@ std::vector<CameraConfig> cameraConfigs;
 std::vector<SwitchedCameraConfig> switchedCameraConfigs;
 std::vector<cs::VideoSource> cameras;
 
-int videoSource{};
-
-IplImage *mapx, *mapy;
+int processingVideoSource{}, viewingVideoSource{};
 
 int width{160}, height{120};
 
@@ -284,13 +282,27 @@ cs::UsbCamera StartCamera(const CameraConfig &config)
               << '\n';
   auto inst = frc::CameraServer::GetInstance();
   cs::UsbCamera camera{config.name, config.path};
-  //auto server = inst->StartAutomaticCapture(camera);
 
   camera.SetConfigJson(config.config);
   camera.SetConnectionStrategy(cs::VideoSource::kConnectionKeepOpen);
 
-  //if (config.streamConfig.is_object())
-  //  server.SetConfigJson(config.streamConfig);
+  return camera;
+}
+
+cs::UsbCamera StartCameraAndStream(const CameraConfig &config)
+{
+  wpi::outs() << "Starting camera '" << config.name << "' on " << config.path
+              << '\n';
+  auto inst = frc::CameraServer::GetInstance();
+  cs::UsbCamera camera{config.name, config.path};
+
+  auto server = inst->StartAutomaticCapture(camera);
+
+  camera.SetConfigJson(config.config);
+  camera.SetConnectionStrategy(cs::VideoSource::kConnectionKeepOpen);
+
+  if (config.streamConfig.is_object())
+    server.SetConfigJson(config.streamConfig);
 
   return camera;
 }
@@ -330,22 +342,37 @@ cs::MjpegServer StartSwitchedCamera(const SwitchedCameraConfig &config)
   return server;
 }
 
-void flashCamera()
+void flashCameras(int processingVideoSource, int viewingVideoSource)
 {
   char buffer[500];
+
+  //Flashes the processingCamera with optimal settings for identifying the targets
+  sprintf(buffer,
+          "v4l2-ctl -d /dev/video%d \
+		--set-ctrl brightness=100 \
+		--set-ctrl contrast=255 \
+		--set-ctrl saturation=100 \
+		--set-ctrl white_balance_temperature_auto=0 \
+		--set-ctrl white_balance_temperature=0 \
+		--set-ctrl sharpness=24 \
+		--set-ctrl gain=24 \
+		--set-ctrl exposure_auto=1 \
+		--set-ctrl exposure_absolute=380",
+          processingVideoSource);
+  system(buffer);
+
   //Makes sure the viewingCamera is set to its optimal settings for actually seeing what's going on
   sprintf(buffer,
           "v4l2-ctl -d /dev/video%d \
 		--set-ctrl brightness=0 \
 		--set-ctrl contrast=32 \
-		--set-ctrl saturation=60 \
-		--set-ctrl white_balance_temperature_auto=0 \
-		--set-ctrl white_balance_temperature=0 \
-		--set-ctrl sharpness=2 \
-		--set-ctrl gain=0 \
-		--set-ctrl exposure_auto=1 \
-		--set-ctrl exposure_absolute=105",
-          videoSource);
+		--set-ctrl saturation=64 \
+		--set-ctrl white_balance_temperature_auto=1 \
+		--set-ctrl sharpness=24 \
+		--set-ctrl gain=24 \
+		--set-ctrl power_line_frequency=2 \
+		--set-ctrl exposure_auto=0",
+          viewingVideoSource);
   system(buffer);
 }
 
@@ -358,7 +385,7 @@ public:
       verticalAngleError{0},
       horizontalAngleError{0};
 
-  cv::Scalar hsvLow{70, 150, 230},
+  cv::Scalar hsvLow{40, 130, 230},
       hsvHigh{110, 210, 255};
 
   int minArea{60},
@@ -375,9 +402,10 @@ public:
 
   cv::Mat morphElement{cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3))};
 
-  bool processingVision{false};
+  bool processingVision{true};
+  bool streamVision{false};
 
-  cs::CvSource processingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Processing Camera", 160, 120);
+  cs::CvSource processingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Processing Camera", width, height);
 
   int frameCounter{0};
 
@@ -396,6 +424,11 @@ public:
     //Shaves down the bright parts of the image and then expands them to remove small false positives
     cv::erode(frame, frame, morphElement, cv::Point(-1, -1), 2);
     cv::dilate(frame, frame, morphElement, cv::Point(-1, -1), 2);
+
+    if (streamVision)
+    {
+      processingOutputStream.PutFrame(frame);
+    }
 
     //Applies the Canny edge detection algorithm to extract edges
     cv::Canny(frame, frame, 0, 0);
@@ -421,14 +454,14 @@ public:
     {
       if (verbose)
       {
-        std::cout << "*** Could not open video transmitting frame, retrying... ***\n";
+        std::cout << "*** Could not open processing frame, retrying... ***\n";
       }
       return;
     }
 
     if (frameCounter == 45)
     {
-      flashCamera();
+      flashCameras(processingVideoSource, viewingVideoSource);
       ++frameCounter;
     }
     else
@@ -436,20 +469,12 @@ public:
       ++frameCounter;
     }
 
-    cv::line(frame, cv::Point(frame.cols / 2, 0), cv::Point(frame.cols / 2, frame.rows), cv::Scalar(0, 0, 0), 1.5);
-
-    processingOutputStream.PutFrame(frame);
+    cv::resize(frame, frame, cv::Size(width, height), 0, 0, cv::INTER_CUBIC);
 
     if (!processingVision)
     {
       return;
     }
-
-    IplImage img = frame;
-
-    cvRemap(&img, &img, mapx, mapy);
-
-    frame = cv::cvarrToMat(&img);
 
     std::vector<std::vector<cv::Point>> contoursRaw;
     extractContours(contoursRaw, frame, hsvLow, hsvHigh, morphElement);
@@ -627,22 +652,6 @@ int main(int argc, char *argv[])
     ntinst.StartClientTeam(team);
   }
 
-  std::cout << "Beginning\n";
-
-  CvMat *intrinsic{(CvMat *)cvLoad("Intrinsics.xml")};
-  CvMat *distortion{(CvMat *)cvLoad("Distortion.xml")};
-
-  std::cout << "Second\n";
-
-  mapx = cvCreateImage(cv::Size(width, height), IPL_DEPTH_32F, 1);
-  mapy = cvCreateImage(cv::Size(width, height), IPL_DEPTH_32F, 1);
-
-  std::cout << "Fourth\n";
-
-  cvInitUndistortMap(intrinsic, distortion, mapx, mapy);
-
-  std::cout << "Sixth\n";
-
   system("ls /dev/video*");
 
   FILE *uname;
@@ -665,20 +674,36 @@ int main(int argc, char *argv[])
 	 * 	- Parses the output character for an integer
 	 * 	- Assigns that integer to the appropriate variable
 	 */
-  videoSource = outputString.at(outputString.find("/dev/video", outputString.find("USB 2.0 Camera: HD USB Camera")) + 10) - '0';
+  viewingVideoSource = outputString.at(outputString.find("/dev/video", outputString.find("USB 2.0 Camera: HD USB Camera")) + 10) - '0';
+  processingVideoSource = outputString.at(outputString.find("/dev/video", outputString.find("UVC Camera (046d:081b)")) + 10) - '0';
   pclose(uname);
 
   // start cameras
   for (const auto &config : cameraConfigs)
-    cameras.emplace_back(StartCamera(config));
+  {
+    if (config.name == "Fisheye")
+    {
+      cameras.emplace_back(StartCameraAndStream(config));
+    }
+    else
+    {
+      cameras.emplace_back(StartCamera(config));
+    }
+  }
 
-  flashCamera();
+  // flashes the cameras with the wrong settings followed by the right settings
+  // this is more reliable than just flashing the good settings (idk why)
+  flashCameras(viewingVideoSource, processingVideoSource);
+  flashCameras(processingVideoSource, viewingVideoSource);
+
+  int viewingVideoIndex{cameraConfigs.at(0).name == "Fisheye" ? 0 : 1},
+      processingVideoIndex{cameraConfigs.at(0).name == "Fisheye" ? 1 : 0};
 
   // start image processing on the processing camera if present
   if (cameras.size() >= 1)
   {
     std::thread([&] {
-      frc::VisionRunner<MyPipeline> runner(cameras[0], new MyPipeline(),
+      frc::VisionRunner<MyPipeline> runner(cameras.at(processingVideoIndex), new MyPipeline(),
                                            [&](MyPipeline &pipeline) {
                                              // do something with pipeline results
                                            });
