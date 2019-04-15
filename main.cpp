@@ -97,8 +97,6 @@ std::vector<cs::VideoSource> cameras;
 
 int processingVideoSource{}, viewingVideoSource{};
 
-int width{160}, height{120};
-
 wpi::raw_ostream &ParseError()
 {
   return wpi::errs() << "config error in '" << configFile << "': ";
@@ -371,7 +369,7 @@ void flashCameras(int processingVideoSource, int viewingVideoSource)
 		--set-ctrl sharpness=24 \
 		--set-ctrl gain=24 \
 		--set-ctrl power_line_frequency=2 \
-		--set-ctrl exposure_auto=0",
+		--set-ctrl exposure_auto=3",
           viewingVideoSource);
   system(buffer);
 }
@@ -394,7 +392,8 @@ public:
   double horizontalFOV{30},
       verticalFOV{60};
 
-  int width{160}, height{120};
+  int streamingWidth{160}, streamingHeight{120},
+    processingWidth{320}, processingHeight{240};
 
   std::string udpHost{"10.28.51.2"};
   int udpSendPort{1182}, udpReceivePort{1183};
@@ -402,10 +401,10 @@ public:
 
   cv::Mat morphElement{cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3))};
 
-  bool processingVision{true};
+  bool processingVision{false};
   bool streamVision{false};
 
-  cs::CvSource processingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Processing Camera", width, height);
+  cs::CvSource processingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Processing Camera", processingWidth, processingHeight);
 
   int frameCounter{0};
 
@@ -469,12 +468,12 @@ public:
       ++frameCounter;
     }
 
-    cv::resize(frame, frame, cv::Size(width, height), 0, 0, cv::INTER_CUBIC);
-
     if (!processingVision)
     {
       return;
     }
+
+    cv::resize(frame, frame, cv::Size(processingWidth, processingHeight), 0, 0, cv::INTER_CUBIC);
 
     std::vector<std::vector<cv::Point>> contoursRaw;
     extractContours(contoursRaw, frame, hsvLow, hsvHigh, morphElement);
@@ -571,8 +570,8 @@ public:
       double comparePairCenter{((std::max(pairs.at(p).at(0).rotatedBoundingBox.center.x, pairs.at(p).at(1).rotatedBoundingBox.center.x) - std::min(pairs.at(p).at(0).rotatedBoundingBox.center.x, pairs.at(p).at(1).rotatedBoundingBox.center.x)) / 2) + std::min(pairs.at(p).at(0).rotatedBoundingBox.center.x, pairs.at(p).at(1).rotatedBoundingBox.center.x)};
       double closestPairCenter{((std::max(closestPair.at(0).rotatedBoundingBox.center.x, closestPair.at(1).rotatedBoundingBox.center.x) - std::min(closestPair.at(0).rotatedBoundingBox.center.x, closestPair.at(1).rotatedBoundingBox.center.x)) / 2) + std::min(closestPair.at(0).rotatedBoundingBox.center.x, closestPair.at(1).rotatedBoundingBox.center.x)};
 
-      if (std::abs(comparePairCenter) - (width / 2) <
-          std::abs(closestPairCenter) - (width / 2))
+      if (std::abs(comparePairCenter) - (processingWidth / 2) <
+          std::abs(closestPairCenter) - (processingWidth / 2))
       {
         closestPair = std::array<Contour, 2>{pairs.at(p).at(0), pairs.at(p).at(1)};
       }
@@ -593,18 +592,18 @@ public:
     horizontalAngleError = -((frame.cols / 2.0) - centerX) / frame.cols * horizontalFOV;
     //verticalAngleError = ((processingFrame.rows / 2.0) - centerY) / frame.rows * horizontalFOV;
 
-    //double height = closestPair.at(0).rotatedBoundingBox.size.width;
+    //double streamingHeight = closestPair.at(0).rotatedBoundingBox.size.streamingWidth;
 
     /*
-		height(pixels) / vertical(total pixels) = 6.31(height of tape in inches) / height(of frame in inches)
-		height of frame(inches) = 6.31 * vertical(pixels) / height(pixels)
+		streamingHeight(pixels) / vertical(total pixels) = 6.31(streamingHeight of tape in inches) / streamingHeight(of frame in inches)
+		streamingHeight of frame(inches) = 6.31 * vertical(pixels) / streamingHeight(pixels)
 		
-		tan(30) = 0.5*height of frame(inches) / distance
-		distance = 0.5*height of frame(inches) / tan(30)
+		tan(30) = 0.5*streamingHeight of frame(inches) / distance
+		distance = 0.5*streamingHeight of frame(inches) / tan(30)
 		
-		distance = 0.5 * 6.31 * vertical(pixels) / height(pixels) / tan(vertical FOV / 2)
+		distance = 0.5 * 6.31 * vertical(pixels) / streamingHeight(pixels) / tan(vertical FOV / 2)
 		*/
-    //double distance = 0.5 * 6.31 * frame.rows / height / std::tan(verticalFOV * 0.5 * 3.141592654 / 180); //1751.45 / height; //.1945 * height * height + -7.75 * height + 122.4;
+    //double distance = 0.5 * 6.31 * frame.rows / streamingHeight / std::tan(verticalFOV * 0.5 * 3.141592654 / 180); //1751.45 / streamingHeight; //.1945 * streamingHeight * streamingHeight + -7.75 * streamingHeight + 122.4;
 
     // Conversion to radians (the std trigonometry functions only take radians)
     //horizontalAngleError *= 3.141592654 / 180;
@@ -618,7 +617,7 @@ public:
 
     //std::cout << "Max - min y: " << closestPair.at(0).rotatedBoundingBoxPoints[3] -  closestPair.at(0).rotatedBoundingBoxPoints[1] << "\n\n";
 
-    //std::cout << "Height (in pixels): " << height << '\n';
+    //std::cout << "Height (in pixels): " << streamingHeight << '\n';
     //std::cout << "Distance: " << distance << '\n';
     //std::cout << "AOE: " << horizontalAngleError << "\n\n";
 
@@ -716,3 +715,4 @@ int main(int argc, char *argv[])
   for (;;)
     std::this_thread::sleep_for(std::chrono::seconds(10));
 }
+
