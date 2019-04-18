@@ -97,6 +97,14 @@ std::vector<cs::VideoSource> cameras;
 
 int processingVideoSource{}, viewingVideoSource{};
 
+int streamingWidth{160}, streamingHeight{120},
+    processingWidth{320}, processingHeight{240};
+
+bool verbose{true};
+
+cs::CvSource viewingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Fisheye", streamingWidth, streamingHeight);
+cs::CvSource processingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Processing Camera", processingWidth, processingHeight);
+
 wpi::raw_ostream &ParseError()
 {
   return wpi::errs() << "config error in '" << configFile << "': ";
@@ -274,33 +282,17 @@ bool ReadConfig()
   return true;
 }
 
-cs::UsbCamera StartCamera(const CameraConfig &config)
+cs::UsbCamera StartCamera(std::string name, int dev)//const CameraConfig &config)
 {
-  wpi::outs() << "Starting camera '" << config.name << "' on " << config.path
-              << '\n';
+  //wpi::outs() << "Starting camera '" << config.name << "' on " << config.path
+  //            << '\n';
   auto inst = frc::CameraServer::GetInstance();
-  cs::UsbCamera camera{config.name, config.path};
+  //cs::UsbCamera camera{config.name, config.path};
 
-  camera.SetConfigJson(config.config);
+  cs::UsbCamera camera{name, dev};
+
+  //camera.SetConfigJson(config.config);
   camera.SetConnectionStrategy(cs::VideoSource::kConnectionKeepOpen);
-
-  return camera;
-}
-
-cs::UsbCamera StartCameraAndStream(const CameraConfig &config)
-{
-  wpi::outs() << "Starting camera '" << config.name << "' on " << config.path
-              << '\n';
-  auto inst = frc::CameraServer::GetInstance();
-  cs::UsbCamera camera{config.name, config.path};
-
-  auto server = inst->StartAutomaticCapture(camera);
-
-  camera.SetConfigJson(config.config);
-  camera.SetConnectionStrategy(cs::VideoSource::kConnectionKeepOpen);
-
-  if (config.streamConfig.is_object())
-    server.SetConfigJson(config.streamConfig);
 
   return camera;
 }
@@ -347,7 +339,7 @@ void flashCameras(int processingVideoSource, int viewingVideoSource)
   //Flashes the processingCamera with optimal settings for identifying the targets
   sprintf(buffer,
           "v4l2-ctl -d /dev/video%d \
-		--set-ctrl brightness=100 \
+                --set-ctrl brightness=100 \
 		--set-ctrl contrast=255 \
 		--set-ctrl saturation=100 \
 		--set-ctrl white_balance_temperature_auto=0 \
@@ -355,7 +347,7 @@ void flashCameras(int processingVideoSource, int viewingVideoSource)
 		--set-ctrl sharpness=24 \
 		--set-ctrl gain=24 \
 		--set-ctrl exposure_auto=1 \
-		--set-ctrl exposure_absolute=380",
+		--set-ctrl exposure_absolute=100",
           processingVideoSource);
   system(buffer);
 
@@ -372,19 +364,22 @@ void flashCameras(int processingVideoSource, int viewingVideoSource)
 		--set-ctrl exposure_auto=3",
           viewingVideoSource);
   system(buffer);
+
+  if (verbose)
+  {
+    std::cout << "--- Flashed Cameras ---\n";
+  }
 }
 
 class MyPipeline : public frc::VisionPipeline
 {
 public:
-  bool verbose{true};
-
   double distanceTo{0},
       verticalAngleError{0},
       horizontalAngleError{0};
 
-  cv::Scalar hsvLow{40, 130, 230},
-      hsvHigh{110, 210, 255};
+  cv::Scalar hsvLow{63, 0, 150},//{64, 93, 200},
+      hsvHigh{100, 255, 255};//{110, 210, 255};
 
   int minArea{60},
       minRotation{30};
@@ -392,24 +387,30 @@ public:
   double horizontalFOV{30},
       verticalFOV{60};
 
-  int streamingWidth{160}, streamingHeight{120},
-    processingWidth{320}, processingHeight{240};
-
   std::string udpHost{"10.28.51.2"};
   int udpSendPort{1182}, udpReceivePort{1183};
   UDPHandler udpHandler{udpHost, udpSendPort, udpReceivePort};
 
   cv::Mat morphElement{cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3))};
 
-  bool processingVision{false};
-  bool streamVision{false};
+  bool processingVision{true};
+  bool streamVision{true};
 
-  cs::CvSource processingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Processing Camera", processingWidth, processingHeight);
+  bool isProcessingCamera{};
 
   int frameCounter{0};
 
+  MyPipeline(bool newIsProcessingCamera) : isProcessingCamera{newIsProcessingCamera}
+  {
+  }
+
   void extractContours(std::vector<std::vector<cv::Point>> &contours, cv::Mat frame, cv::Scalar &hsvLowThreshold, cv::Scalar &hsvHighThreshold, cv::Mat morphElement)
   {
+    if (isProcessingCamera && streamVision)
+    {
+      processingOutputStream.PutFrame(frame);
+    }
+
     cv::cvtColor(frame, frame, cv::COLOR_BGR2HSV);
 
     //Singles out the pixels that meet the HSV range of the target and displays them
@@ -423,11 +424,6 @@ public:
     //Shaves down the bright parts of the image and then expands them to remove small false positives
     cv::erode(frame, frame, morphElement, cv::Point(-1, -1), 2);
     cv::dilate(frame, frame, morphElement, cv::Point(-1, -1), 2);
-
-    if (streamVision)
-    {
-      processingOutputStream.PutFrame(frame);
-    }
 
     //Applies the Canny edge detection algorithm to extract edges
     cv::Canny(frame, frame, 0, 0);
@@ -468,6 +464,15 @@ public:
       ++frameCounter;
     }
 
+    if (!isProcessingCamera)
+    {
+      cv::Mat transmitFrame;
+      frame.copyTo(transmitFrame);
+      cv::resize(transmitFrame, transmitFrame, cv::Size(streamingWidth, streamingHeight), 0, 0, cv::INTER_CUBIC);
+      cv::line(transmitFrame, cv::Point(transmitFrame.cols / 2, 0), cv::Point(transmitFrame.cols / 2, transmitFrame.rows), cv::Scalar(0, 0, 0), 1.5);
+      viewingOutputStream.PutFrame(transmitFrame);
+    }
+
     if (!processingVision)
     {
       return;
@@ -481,11 +486,6 @@ public:
     for (int i{0}; i < contoursRaw.size(); ++i)
     {
       contours.at(i) = Contour(contoursRaw.at(i));
-    }
-
-    if (verbose)
-    {
-      std::cout << "--- Extracted contours ---\n";
     }
 
     if (contours.size() < 2)
@@ -674,45 +674,51 @@ int main(int argc, char *argv[])
 	 * 	- Assigns that integer to the appropriate variable
 	 */
   viewingVideoSource = outputString.at(outputString.find("/dev/video", outputString.find("USB 2.0 Camera: HD USB Camera")) + 10) - '0';
-  processingVideoSource = outputString.at(outputString.find("/dev/video", outputString.find("UVC Camera (046d:081b)")) + 10) - '0';
+  processingVideoSource = outputString.at(outputString.find("/dev/video", outputString.find("UVC Camera")) + 10) - '0';
   pclose(uname);
 
-  // start cameras
-  for (const auto &config : cameraConfigs)
-  {
-    if (config.name == "Fisheye")
-    {
-      cameras.emplace_back(StartCameraAndStream(config));
-    }
-    else
-    {
-      cameras.emplace_back(StartCamera(config));
-    }
-  }
-
-  // flashes the cameras with the wrong settings followed by the right settings
-  // this is more reliable than just flashing the good settings (idk why)
-  flashCameras(viewingVideoSource, processingVideoSource);
-  flashCameras(processingVideoSource, viewingVideoSource);
-
-  int viewingVideoIndex{cameraConfigs.at(0).name == "Fisheye" ? 0 : 1},
-      processingVideoIndex{cameraConfigs.at(0).name == "Fisheye" ? 1 : 0};
+  cameras.emplace_back(StartCamera("Fisheye", viewingVideoSource));
+  cameras.emplace_back(StartCamera("Processing", processingVideoSource));
 
   // start image processing on the processing camera if present
-  if (cameras.size() >= 1)
-  {
-    std::thread([&] {
-      frc::VisionRunner<MyPipeline> runner(cameras.at(processingVideoIndex), new MyPipeline(),
-                                           [&](MyPipeline &pipeline) {
-                                             // do something with pipeline results
-                                           });
-      runner.RunForever();
-    })
-        .detach();
-  }
+  std::thread([&] {
+    frc::VisionRunner<MyPipeline> runner(cameras.at(0), new MyPipeline(false),
+                                         [&](MyPipeline &pipeline) {
+                                           // do something with pipeline results
+                                         });
+    runner.RunForever();
+  })
+      .detach();
+
+  std::thread([&] {
+    frc::VisionRunner<MyPipeline> runner(cameras.at(1), new MyPipeline(true),
+                                         [&](MyPipeline &pipeline) {
+                                           // do something with pipeline results
+                                         });
+    runner.RunForever();
+  })
+      .detach();
+
+  char buffer[500];
+  sprintf(buffer,
+          "v4l2-ctl --device=/dev/video%d --list-ctrls",
+          processingVideoSource);
 
   // loop forever
   for (;;)
-    std::this_thread::sleep_for(std::chrono::seconds(10));
-}
+  {
+    // flashes the cameras with the wrong settings followed by the right settings
+    // this is more reliable than just flashing the good settings (idk why)
+    //flashCameras(viewingVideoSource, processingVideoSource);
+    flashCameras(processingVideoSource, viewingVideoSource);
 
+    system(buffer);
+
+    std::this_thread::sleep_for(std::chrono::seconds(15));
+
+    //for (int i{0}; i < cameras.size(); ++i)
+    //{
+    //cameras.at(i).SetConfigJson(cameraConfigs.at(i).config);
+    //}
+  }
+}
