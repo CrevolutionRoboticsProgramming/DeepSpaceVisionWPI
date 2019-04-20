@@ -12,325 +12,11 @@
 #include <iostream>
 #include <fstream>
 
-#include <networktables/NetworkTableInstance.h>
-#include <vision/VisionPipeline.h>
-#include <vision/VisionRunner.h>
-#include <wpi/StringRef.h>
-#include <wpi/json.h>
-#include <wpi/raw_istream.h>
-#include <wpi/raw_ostream.h>
-#include <opencv2/opencv.hpp>
-#include <opencv2/core/core.hpp>
-
-#include "cameraserver/CameraServer.h"
+#include "WPIReaderFunctions.h"
 #include "UDPHandler.h"
 #include "Contour.h"
 
-/*
-   JSON format:
-   {
-       "team": <team number>,
-       "ntmode": <"client" or "server", "client" if unspecified>
-       "cameras": [
-           {
-               "name": <camera name>
-               "path": <path, e.g. "/dev/video0">
-               "pixel format": <"MJPEG", "YUYV", etc>   // optional
-               "width": <video mode width>              // optional
-               "height": <video mode height>            // optional
-               "fps": <video mode fps>                  // optional
-               "brightness": <percentage brightness>    // optional
-               "white balance": <"auto", "hold", value> // optional
-               "exposure": <"auto", "hold", value>      // optional
-               "properties": [                          // optional
-                   {
-                       "name": <property name>
-                       "value": <property value>
-                   }
-               ],
-               "stream": {                              // optional
-                   "properties": [
-                       {
-                           "name": <stream property name>
-                           "value": <stream property value>
-                       }
-                   ]
-               }
-           }
-       ]
-       "switched cameras": [
-           {
-               "name": <virtual camera name>
-               "key": <network table key used for selection>
-               // if NT value is a string, it's treated as a name
-               // if NT value is a double, it's treated as an integer index
-           }
-       ]
-   }
- */
-
-static const char *configFile = "/boot/frc.json";
-
-namespace
-{
-
-unsigned int team;
-bool server = false;
-
-struct CameraConfig
-{
-  std::string name;
-  std::string path;
-  wpi::json config;
-  wpi::json streamConfig;
-};
-
-struct SwitchedCameraConfig
-{
-  std::string name;
-  std::string key;
-};
-
-std::vector<CameraConfig> cameraConfigs;
-std::vector<SwitchedCameraConfig> switchedCameraConfigs;
-std::vector<cs::VideoSource> cameras;
-
-int processingVideoSource{}, viewingVideoSource{};
-
-int streamingWidth{160}, streamingHeight{120},
-    processingWidth{320}, processingHeight{240};
-
 bool verbose{true};
-
-cs::CvSource viewingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Fisheye", streamingWidth, streamingHeight);
-cs::CvSource processingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Processing Camera", processingWidth, processingHeight);
-
-wpi::raw_ostream &ParseError()
-{
-  return wpi::errs() << "config error in '" << configFile << "': ";
-}
-
-bool ReadCameraConfig(const wpi::json &config)
-{
-  CameraConfig c;
-
-  // name
-  try
-  {
-    c.name = config.at("name").get<std::string>();
-  }
-  catch (const wpi::json::exception &e)
-  {
-    ParseError() << "could not read camera name: " << e.what() << '\n';
-    return false;
-  }
-
-  // path
-  try
-  {
-    c.path = config.at("path").get<std::string>();
-  }
-  catch (const wpi::json::exception &e)
-  {
-    ParseError() << "camera '" << c.name
-                 << "': could not read path: " << e.what() << '\n';
-    return false;
-  }
-
-  // stream properties
-  if (config.count("stream") != 0)
-    c.streamConfig = config.at("stream");
-
-  c.config = config;
-
-  cameraConfigs.emplace_back(std::move(c));
-  return true;
-}
-
-bool ReadSwitchedCameraConfig(const wpi::json &config)
-{
-  SwitchedCameraConfig c;
-
-  // name
-  try
-  {
-    c.name = config.at("name").get<std::string>();
-  }
-  catch (const wpi::json::exception &e)
-  {
-    ParseError() << "could not read switched camera name: " << e.what() << '\n';
-    return false;
-  }
-
-  // key
-  try
-  {
-    c.key = config.at("key").get<std::string>();
-  }
-  catch (const wpi::json::exception &e)
-  {
-    ParseError() << "switched camera '" << c.name
-                 << "': could not read key: " << e.what() << '\n';
-    return false;
-  }
-
-  switchedCameraConfigs.emplace_back(std::move(c));
-  return true;
-}
-
-bool ReadConfig()
-{
-  // open config file
-  std::error_code ec;
-  wpi::raw_fd_istream is(configFile, ec);
-  if (ec)
-  {
-    wpi::errs() << "could not open '" << configFile << "': " << ec.message()
-                << '\n';
-    return false;
-  }
-
-  // parse file
-  wpi::json j;
-  try
-  {
-    j = wpi::json::parse(is);
-  }
-  catch (const wpi::json::parse_error &e)
-  {
-    ParseError() << "byte " << e.byte << ": " << e.what() << '\n';
-    return false;
-  }
-
-  // top level must be an object
-  if (!j.is_object())
-  {
-    ParseError() << "must be JSON object\n";
-    return false;
-  }
-
-  // team number
-  try
-  {
-    team = j.at("team").get<unsigned int>();
-  }
-  catch (const wpi::json::exception &e)
-  {
-    ParseError() << "could not read team number: " << e.what() << '\n';
-    return false;
-  }
-
-  // ntmode (optional)
-  if (j.count("ntmode") != 0)
-  {
-    try
-    {
-      auto str = j.at("ntmode").get<std::string>();
-      wpi::StringRef s(str);
-      if (s.equals_lower("client"))
-      {
-        server = false;
-      }
-      else if (s.equals_lower("server"))
-      {
-        server = true;
-      }
-      else
-      {
-        ParseError() << "could not understand ntmode value '" << str << "'\n";
-      }
-    }
-    catch (const wpi::json::exception &e)
-    {
-      ParseError() << "could not read ntmode: " << e.what() << '\n';
-    }
-  }
-
-  // cameras
-  try
-  {
-    for (auto &&camera : j.at("cameras"))
-    {
-      if (!ReadCameraConfig(camera))
-        return false;
-    }
-  }
-  catch (const wpi::json::exception &e)
-  {
-    ParseError() << "could not read cameras: " << e.what() << '\n';
-    return false;
-  }
-
-  // switched cameras (optional)
-  if (j.count("switched cameras") != 0)
-  {
-    try
-    {
-      for (auto &&camera : j.at("switched cameras"))
-      {
-        if (!ReadSwitchedCameraConfig(camera))
-          return false;
-      }
-    }
-    catch (const wpi::json::exception &e)
-    {
-      ParseError() << "could not read switched cameras: " << e.what() << '\n';
-      return false;
-    }
-  }
-
-  return true;
-}
-
-cs::UsbCamera StartCamera(std::string name, int dev)//const CameraConfig &config)
-{
-  //wpi::outs() << "Starting camera '" << config.name << "' on " << config.path
-  //            << '\n';
-  auto inst = frc::CameraServer::GetInstance();
-  //cs::UsbCamera camera{config.name, config.path};
-
-  cs::UsbCamera camera{name, dev};
-
-  //camera.SetConfigJson(config.config);
-  camera.SetConnectionStrategy(cs::VideoSource::kConnectionKeepOpen);
-
-  return camera;
-}
-
-cs::MjpegServer StartSwitchedCamera(const SwitchedCameraConfig &config)
-{
-  wpi::outs() << "Starting switched camera '" << config.name << "' on "
-              << config.key << '\n';
-  auto server =
-      frc::CameraServer::GetInstance()->AddSwitchedCamera(config.name);
-
-  nt::NetworkTableInstance::GetDefault()
-      .GetEntry(config.key)
-      .AddListener(
-          [server](const auto &event) mutable {
-            if (event.value->IsDouble())
-            {
-              int i = event.value->GetDouble();
-              if (i >= 0 && i < cameras.size())
-                server.SetSource(cameras[i]);
-            }
-            else if (event.value->IsString())
-            {
-              auto str = event.value->GetString();
-              for (int i = 0; i < cameraConfigs.size(); ++i)
-              {
-                if (str == cameraConfigs[i].name)
-                {
-                  server.SetSource(cameras[i]);
-                  break;
-                }
-              }
-            }
-          },
-          NT_NOTIFY_IMMEDIATE | NT_NOTIFY_NEW | NT_NOTIFY_UPDATE);
-
-  return server;
-}
 
 void flashCameras(int processingVideoSource, int viewingVideoSource)
 {
@@ -339,7 +25,7 @@ void flashCameras(int processingVideoSource, int viewingVideoSource)
   //Flashes the processingCamera with optimal settings for identifying the targets
   sprintf(buffer,
           "v4l2-ctl -d /dev/video%d \
-                --set-ctrl brightness=100 \
+		--set-ctrl brightness=100 \
 		--set-ctrl contrast=255 \
 		--set-ctrl saturation=100 \
 		--set-ctrl white_balance_temperature_auto=0 \
@@ -378,14 +64,16 @@ public:
       verticalAngleError{0},
       horizontalAngleError{0};
 
-  cv::Scalar hsvLow{63, 0, 150},//{64, 93, 200},
-      hsvHigh{100, 255, 255};//{110, 210, 255};
+  cv::Scalar hsvLow{63, 0, 120},
+      hsvHigh{120, 255, 255};
 
   int minArea{60},
       minRotation{30};
 
   double horizontalFOV{30},
       verticalFOV{60};
+
+  int width{320}, height{240};
 
   std::string udpHost{"10.28.51.2"};
   int udpSendPort{1182}, udpReceivePort{1183};
@@ -396,21 +84,12 @@ public:
   bool processingVision{true};
   bool streamVision{true};
 
-  bool isProcessingCamera{};
+  cs::CvSource processingOutputStream = frc::CameraServer::GetInstance()->PutVideo("Processing Camera", width, height);
 
   int frameCounter{0};
 
-  MyPipeline(bool newIsProcessingCamera) : isProcessingCamera{newIsProcessingCamera}
-  {
-  }
-
   void extractContours(std::vector<std::vector<cv::Point>> &contours, cv::Mat frame, cv::Scalar &hsvLowThreshold, cv::Scalar &hsvHighThreshold, cv::Mat morphElement)
   {
-    if (isProcessingCamera && streamVision)
-    {
-      processingOutputStream.PutFrame(frame);
-    }
-
     cv::cvtColor(frame, frame, cv::COLOR_BGR2HSV);
 
     //Singles out the pixels that meet the HSV range of the target and displays them
@@ -454,23 +133,10 @@ public:
       return;
     }
 
+    ++frameCounter;
     if (frameCounter == 45)
     {
       flashCameras(processingVideoSource, viewingVideoSource);
-      ++frameCounter;
-    }
-    else
-    {
-      ++frameCounter;
-    }
-
-    if (!isProcessingCamera)
-    {
-      cv::Mat transmitFrame;
-      frame.copyTo(transmitFrame);
-      cv::resize(transmitFrame, transmitFrame, cv::Size(streamingWidth, streamingHeight), 0, 0, cv::INTER_CUBIC);
-      cv::line(transmitFrame, cv::Point(transmitFrame.cols / 2, 0), cv::Point(transmitFrame.cols / 2, transmitFrame.rows), cv::Scalar(0, 0, 0), 1.5);
-      viewingOutputStream.PutFrame(transmitFrame);
     }
 
     if (!processingVision)
@@ -478,7 +144,13 @@ public:
       return;
     }
 
-    cv::resize(frame, frame, cv::Size(processingWidth, processingHeight), 0, 0, cv::INTER_CUBIC);
+    if (frame.cols != width || frame.rows != height)
+      cv::resize(frame, frame, cv::Size(width, height), 0, 0, cv::INTER_CUBIC);
+
+    if (streamVision)
+    {
+      processingOutputStream.PutFrame(frame);
+    }
 
     std::vector<std::vector<cv::Point>> contoursRaw;
     extractContours(contoursRaw, frame, hsvLow, hsvHigh, morphElement);
@@ -570,8 +242,8 @@ public:
       double comparePairCenter{((std::max(pairs.at(p).at(0).rotatedBoundingBox.center.x, pairs.at(p).at(1).rotatedBoundingBox.center.x) - std::min(pairs.at(p).at(0).rotatedBoundingBox.center.x, pairs.at(p).at(1).rotatedBoundingBox.center.x)) / 2) + std::min(pairs.at(p).at(0).rotatedBoundingBox.center.x, pairs.at(p).at(1).rotatedBoundingBox.center.x)};
       double closestPairCenter{((std::max(closestPair.at(0).rotatedBoundingBox.center.x, closestPair.at(1).rotatedBoundingBox.center.x) - std::min(closestPair.at(0).rotatedBoundingBox.center.x, closestPair.at(1).rotatedBoundingBox.center.x)) / 2) + std::min(closestPair.at(0).rotatedBoundingBox.center.x, closestPair.at(1).rotatedBoundingBox.center.x)};
 
-      if (std::abs(comparePairCenter) - (processingWidth / 2) <
-          std::abs(closestPairCenter) - (processingWidth / 2))
+      if (std::abs(comparePairCenter) - (width / 2) <
+          std::abs(closestPairCenter) - (width / 2))
       {
         closestPair = std::array<Contour, 2>{pairs.at(p).at(0), pairs.at(p).at(1)};
       }
@@ -592,18 +264,18 @@ public:
     horizontalAngleError = -((frame.cols / 2.0) - centerX) / frame.cols * horizontalFOV;
     //verticalAngleError = ((processingFrame.rows / 2.0) - centerY) / frame.rows * horizontalFOV;
 
-    //double streamingHeight = closestPair.at(0).rotatedBoundingBox.size.streamingWidth;
+    //double height = closestPair.at(0).rotatedBoundingBox.size.width;
 
     /*
-		streamingHeight(pixels) / vertical(total pixels) = 6.31(streamingHeight of tape in inches) / streamingHeight(of frame in inches)
-		streamingHeight of frame(inches) = 6.31 * vertical(pixels) / streamingHeight(pixels)
+		height(pixels) / vertical(total pixels) = 6.31(height of tape in inches) / height(of frame in inches)
+		height of frame(inches) = 6.31 * vertical(pixels) / height(pixels)
 		
-		tan(30) = 0.5*streamingHeight of frame(inches) / distance
-		distance = 0.5*streamingHeight of frame(inches) / tan(30)
+		tan(30) = 0.5*height of frame(inches) / distance
+		distance = 0.5*height of frame(inches) / tan(30)
 		
-		distance = 0.5 * 6.31 * vertical(pixels) / streamingHeight(pixels) / tan(vertical FOV / 2)
+		distance = 0.5 * 6.31 * vertical(pixels) / height(pixels) / tan(vertical FOV / 2)
 		*/
-    //double distance = 0.5 * 6.31 * frame.rows / streamingHeight / std::tan(verticalFOV * 0.5 * 3.141592654 / 180); //1751.45 / streamingHeight; //.1945 * streamingHeight * streamingHeight + -7.75 * streamingHeight + 122.4;
+    //double distance = 0.5 * 6.31 * frame.rows / height / std::tan(verticalFOV * 0.5 * 3.141592654 / 180); //1751.45 / height; //.1945 * height * height + -7.75 * height + 122.4;
 
     // Conversion to radians (the std trigonometry functions only take radians)
     //horizontalAngleError *= 3.141592654 / 180;
@@ -617,7 +289,7 @@ public:
 
     //std::cout << "Max - min y: " << closestPair.at(0).rotatedBoundingBoxPoints[3] -  closestPair.at(0).rotatedBoundingBoxPoints[1] << "\n\n";
 
-    //std::cout << "Height (in pixels): " << streamingHeight << '\n';
+    //std::cout << "Height (in pixels): " << height << '\n';
     //std::cout << "Distance: " << distance << '\n';
     //std::cout << "AOE: " << horizontalAngleError << "\n\n";
 
@@ -627,30 +299,16 @@ public:
     }
   }
 };
-} // namespace
 
 int main(int argc, char *argv[])
 {
   if (argc >= 2)
     configFile = argv[1];
 
-  // read configuration
   if (!ReadConfig())
     return EXIT_FAILURE;
 
-  // start NetworkTables
-  auto ntinst = nt::NetworkTableInstance::GetDefault();
-  if (server)
-  {
-    wpi::outs() << "Setting up NetworkTables server\n";
-    ntinst.StartServer();
-  }
-  else
-  {
-    wpi::outs() << "Setting up NetworkTables client for team " << team << '\n';
-    ntinst.StartClientTeam(team);
-  }
-
+  // The Pi recognizes both cameras correctly more often when this command is issued
   system("ls /dev/video*");
 
   FILE *uname;
@@ -662,7 +320,7 @@ int main(int argc, char *argv[])
   lastchar = fread(consoleOutput, 1, 300, uname);
   consoleOutput[lastchar] = '\0';
 
-  // Converts the char array to a std::string
+  // Converts the char array to an std::string
   std::string outputString = consoleOutput;
 
   /**
@@ -677,48 +335,53 @@ int main(int argc, char *argv[])
   processingVideoSource = outputString.at(outputString.find("/dev/video", outputString.find("UVC Camera")) + 10) - '0';
   pclose(uname);
 
-  cameras.emplace_back(StartCamera("Fisheye", viewingVideoSource));
-  cameras.emplace_back(StartCamera("Processing", processingVideoSource));
+  // start cameras
+  for (const auto &config : cameraConfigs)
+  {
+    if (config.name == "Fisheye")
+    {
+      cameras.emplace_back(StartCameraAndStream(config));
+    }
+    else
+    {
+      cameras.emplace_back(StartCamera(config));
+    }
+  }
+
+  // Flashes the cameras with the wrong settings followed by the right settings
+  // This is more reliable than just flashing the good settings (I don't know why)
+  flashCameras(viewingVideoSource, processingVideoSource);
+  flashCameras(processingVideoSource, viewingVideoSource);
+
+  int viewingVideoIndex{cameraConfigs.at(0).name == "Fisheye" ? 0 : 1},
+      processingVideoIndex{cameraConfigs.at(0).name == "Fisheye" ? 1 : 0};
 
   // start image processing on the processing camera if present
-  std::thread([&] {
-    frc::VisionRunner<MyPipeline> runner(cameras.at(0), new MyPipeline(false),
-                                         [&](MyPipeline &pipeline) {
-                                           // do something with pipeline results
-                                         });
-    runner.RunForever();
-  })
-      .detach();
-
-  std::thread([&] {
-    frc::VisionRunner<MyPipeline> runner(cameras.at(1), new MyPipeline(true),
-                                         [&](MyPipeline &pipeline) {
-                                           // do something with pipeline results
-                                         });
-    runner.RunForever();
-  })
-      .detach();
+  if (cameras.size() >= 1)
+  {
+    std::thread([&] {
+      frc::VisionRunner<MyPipeline> runner(cameras.at(processingVideoIndex), new MyPipeline(),
+                                           [&](MyPipeline &pipeline) {
+                                             // do something with pipeline results
+                                           });
+      runner.RunForever();
+    })
+        .detach();
+  }
 
   char buffer[500];
   sprintf(buffer,
-          "v4l2-ctl --device=/dev/video%d --list-ctrls",
+          "v4l2-ctl --device=/dev/video%d --list-ctrls &",
           processingVideoSource);
 
   // loop forever
   for (;;)
   {
-    // flashes the cameras with the wrong settings followed by the right settings
-    // this is more reliable than just flashing the good settings (idk why)
-    //flashCameras(viewingVideoSource, processingVideoSource);
+    // Re-flashes the camera every fifteen seconds to ensure that they were calibrated correctly
     flashCameras(processingVideoSource, viewingVideoSource);
 
     system(buffer);
 
     std::this_thread::sleep_for(std::chrono::seconds(15));
-
-    //for (int i{0}; i < cameras.size(); ++i)
-    //{
-    //cameras.at(i).SetConfigJson(cameraConfigs.at(i).config);
-    //}
   }
 }
