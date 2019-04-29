@@ -33,7 +33,7 @@ void flashCameras(int processingVideoSource, int viewingVideoSource)
 		--set-ctrl sharpness=24 \
 		--set-ctrl gain=24 \
 		--set-ctrl exposure_auto=1 \
-		--set-ctrl exposure_absolute=100",
+		--set-ctrl exposure_absolute=130",
           processingVideoSource);
   system(buffer);
 
@@ -64,14 +64,14 @@ public:
       verticalAngleError{0},
       horizontalAngleError{0};
 
-  cv::Scalar hsvLow{63, 0, 120},
+  cv::Scalar hsvLow{63, 100, 220},
       hsvHigh{120, 255, 255};
 
-  int minArea{60},
+  int minArea{15},
       minRotation{30};
 
-  double horizontalFOV{30},
-      verticalFOV{60};
+  double horizontalFOV{60},
+      verticalFOV{30};
 
   int width{320}, height{240};
 
@@ -90,6 +90,11 @@ public:
 
   void extractContours(std::vector<std::vector<cv::Point>> &contours, cv::Mat frame, cv::Scalar &hsvLowThreshold, cv::Scalar &hsvHighThreshold, cv::Mat morphElement)
   {
+    if (streamVision)
+    {
+      processingOutputStream.PutFrame(frame);
+    }
+
     cv::cvtColor(frame, frame, cv::COLOR_BGR2HSV);
 
     //Singles out the pixels that meet the HSV range of the target and displays them
@@ -146,11 +151,6 @@ public:
 
     if (frame.cols != width || frame.rows != height)
       cv::resize(frame, frame, cv::Size(width, height), 0, 0, cv::INTER_CUBIC);
-
-    if (streamVision)
-    {
-      processingOutputStream.PutFrame(frame);
-    }
 
     std::vector<std::vector<cv::Point>> contoursRaw;
     extractContours(contoursRaw, frame, hsvLow, hsvHigh, morphElement);
@@ -336,14 +336,16 @@ int main(int argc, char *argv[])
   pclose(uname);
 
   // start cameras
-  for (const auto &config : cameraConfigs)
+  for (auto &config : cameraConfigs)
   {
     if (config.name == "Fisheye")
     {
+      config.path.back() = std::to_string(viewingVideoSource).c_str()[0];
       cameras.emplace_back(StartCameraAndStream(config));
     }
     else
     {
+      config.path.back() = std::to_string(processingVideoSource).c_str()[0];
       cameras.emplace_back(StartCamera(config));
     }
   }
@@ -356,7 +358,7 @@ int main(int argc, char *argv[])
   int viewingVideoIndex{cameraConfigs.at(0).name == "Fisheye" ? 0 : 1},
       processingVideoIndex{cameraConfigs.at(0).name == "Fisheye" ? 1 : 0};
 
-  // start image processing on the processing camera if present
+  // Starts vision processing
   if (cameras.size() >= 1)
   {
     std::thread([&] {
@@ -370,17 +372,34 @@ int main(int argc, char *argv[])
   }
 
   char buffer[500];
-  sprintf(buffer,
-          "v4l2-ctl --device=/dev/video%d --list-ctrls &",
-          processingVideoSource);
 
-  // loop forever
-  for (;;)
+  for(;;)
   {
     // Re-flashes the camera every fifteen seconds to ensure that they were calibrated correctly
     flashCameras(processingVideoSource, viewingVideoSource);
 
     system(buffer);
+
+  sprintf(buffer,
+          "v4l2-ctl --device=/dev/video%d --set-ctrls white_balance_temperature_auto=1",
+          processingVideoSource);
+  system(buffer);
+
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+
+  sprintf(buffer,
+          "v4l2-ctl --device=/dev/video%d --set-ctrls white_balance_temperature_auto=0",
+          processingVideoSource);
+  system(buffer);
+  sprintf(buffer,
+          "v4l2-ctl --device=/dev/video%d --set-ctrls white_balance_temperature=0",
+          processingVideoSource);
+  system(buffer);
+
+
+  sprintf(buffer,
+          "v4l2-ctl --device=/dev/video%d --list-ctrls &",
+          processingVideoSource);
 
     std::this_thread::sleep_for(std::chrono::seconds(15));
   }
